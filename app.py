@@ -17,6 +17,7 @@ GET  /health          — lightweight health-check
 import os
 import sys
 import traceback
+import gdown  # ← add this import
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -32,6 +33,23 @@ CORS(app)
 # ---------------------------------------------------------------------------
 # Model loading (graceful fallback to stub)
 # ---------------------------------------------------------------------------
+# ─── STEP 1: Download model FIRST ───
+def download_models():
+    os.makedirs("models", exist_ok=True)
+    model_path = os.path.join("models", "deepfake_image_model.h5")
+    if not os.path.exists(model_path):
+        print("⬇️ Downloading deepfake_image_model.h5 from Google Drive...")
+        gdown.download(
+            "https://drive.google.com/uc?id=1cVahwkpTw_Fl3QEadgx_42GBcNoTE7dn",
+            model_path,
+            quiet=False
+        )
+        print("✅ Image model downloaded successfully")
+    else:
+        print("✅ Image model already exists locally")
+
+download_models()  # ← call before model loading
+
 MODEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
 MODEL_PATH = os.path.join(MODEL_DIR, "deepfake_image_model.h5")
 

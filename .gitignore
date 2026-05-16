@@ -4,6 +4,3 @@ __pycache__/
 *.pyc
 .env
 # Ignore large local model weights files if you download them locally
-*.h5
-*.pth
-*.onnx
