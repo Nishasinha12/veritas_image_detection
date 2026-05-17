@@ -16,7 +16,6 @@ from flask_cors import CORS
 from PIL import Image
 from huggingface_hub import hf_hub_download
 
-# Force TensorFlow to quiet down optimization warnings
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 import tensorflow as tf
 
@@ -29,7 +28,6 @@ CORS(app)
 MODEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
 MODEL_PATH = os.path.join(MODEL_DIR, "deepfake_image_model.h5")
 
-# Global model container for lazy loading
 model = None
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -63,7 +61,6 @@ def get_model():
         if os.path.isfile(MODEL_PATH):
             try:
                 print(f"🔄 Loading TensorFlow model from {MODEL_PATH}...")
-                # Loaded with compile=False to avoid custom metric/loss binding breaks
                 model = tf.keras.models.load_model(MODEL_PATH, compile=False)
                 print("✅ Image deepfake model loaded successfully.")
             except Exception as e:
@@ -103,20 +100,13 @@ def get_last_conv_layer(loaded_model):
 
 def generate_gradcam_heatmap(img_array, loaded_model):
     """
-    FIX 2: Corrected Grad-CAM gradient computation.
-
-    Root causes fixed:
-      - tape.watch(img_tensor) was wrong: gradients must be computed w.r.t.
-        conv_outputs (intermediate activations), not the raw input pixels.
-        Watching the input image gives pixel-level gradients, not spatial class
-        activation maps. We now use a persistent tape and watch conv_outputs.
-      - predictions[:, 0] could IndexError on scalar outputs; use tf.reshape to
-        safely flatten to a scalar loss value.
-      - Silent black heatmap on zero-max is now logged and returns None cleanly.
-      - Layer selection now uses get_last_conv_layer() (see FIX 1).
-
+    Generates a Grad-CAM activation heatmap overlay.
+    
+    Uses a two-model split so the GradientTape watches conv_outputs
+    BEFORE the classifier forward pass runs — fixing the None gradients bug.
+    
     img_array: (1, 256, 256, 3) normalized float32 matrix
-    Returns: Base64-encoded PNG string of colorized Grad-CAM overlay, or None.
+    Returns: Base64-encoded PNG string of colorized overlay, or None.
     """
     try:
         last_conv_layer_name = get_last_conv_layer(loaded_model)
@@ -126,58 +116,64 @@ def generate_gradcam_heatmap(img_array, loaded_model):
 
         print(f"🔍 Computing Grad-CAM over layer: {last_conv_layer_name}")
 
-        # Sub-graph that outputs BOTH the target conv activations AND final predictions
-        grad_model = tf.keras.models.Model(
+        # ── Step 1: Model that outputs conv activations ──────────────────────
+        conv_model = tf.keras.models.Model(
             inputs=loaded_model.inputs,
-            outputs=[
-                loaded_model.get_layer(last_conv_layer_name).output,
-                loaded_model.output
-            ]
+            outputs=loaded_model.get_layer(last_conv_layer_name).output
         )
+
+        # ── Step 2: Model that takes conv activations → final prediction ─────
+        classifier_input = tf.keras.Input(
+            shape=loaded_model.get_layer(last_conv_layer_name).output.shape[1:]
+        )
+        x = classifier_input
+        found = False
+        for layer in loaded_model.layers:
+            if found:
+                x = layer(x)
+            if layer.name == last_conv_layer_name:
+                found = True
+        classifier_model = tf.keras.Model(inputs=classifier_input, outputs=x)
 
         img_tensor = tf.cast(img_array, tf.float32)
 
-        # FIX 2a: Use persistent=True tape and watch conv_outputs, not img_tensor.
-        # The gradient of the class score w.r.t. the conv feature map is what
-        # Grad-CAM needs. Watching the image gives pixel gradients — not useful here.
+        # ── Step 3: Tape watches conv_outputs BEFORE classifier runs ─────────
+        # This is the critical fix: the tape must observe the full computation
+        # from conv_outputs → predictions → loss to produce valid gradients.
         with tf.GradientTape() as tape:
-            conv_outputs, predictions = grad_model(img_tensor, training=False)
-            tape.watch(conv_outputs)   # ✅ watch the conv layer, not the input
-            loss = predictions[:, 0]
+            conv_outputs = conv_model(img_tensor, training=False)
+            tape.watch(conv_outputs)
+            predictions = classifier_model(conv_outputs, training=False)
+            loss = tf.reduce_mean(predictions[:, 0])
 
-        # Extract target spatial weights feature map gradient
+        # ── Step 4: Compute gradients ────────────────────────────────────────
         grads = tape.gradient(loss, conv_outputs)
         if grads is None:
-            print("⚠️ Gradients are None — layer may not be differentiable")
+            print("⚠️ Gradients are None — layer may not be differentiable.")
             return None
-        pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
-        
-        # Weight each feature map channel by its pooled gradient importance
-        conv_outputs = conv_outputs[0]                          # (H, W, C)
-        heatmap = conv_outputs @ pooled_grads[..., tf.newaxis]  # (H, W, 1)
+
+        pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))  # (C,)
+
+        # ── Step 5: Weight channels by gradient importance ───────────────────
+        conv_out = conv_outputs[0]                              # (H, W, C)
+        heatmap = conv_out @ pooled_grads[..., tf.newaxis]      # (H, W, 1)
         heatmap = tf.squeeze(heatmap).numpy()                   # (H, W)
+        heatmap = np.maximum(heatmap, 0)                        # ReLU
 
-        # Apply ReLU: only highlight regions that positively activate the class
-        heatmap = np.maximum(heatmap, 0)
-
-        # FIX 2c: Guard against a zero/flat heatmap (would produce pure black overlay)
         if heatmap.max() == 0:
-            print("⚠️ Grad-CAM heatmap is uniformly zero — model may be overconfident "
-                  "or the selected layer has no spatial variation for this input.")
+            print("⚠️ Heatmap is uniformly zero — no spatial activation detected.")
             return None
 
-        heatmap = heatmap / heatmap.max()  # Normalize to [0, 1]
+        heatmap = heatmap / heatmap.max()                       # Normalize [0, 1]
 
-        # Resize heatmap to match input image dimensions
+        # ── Step 6: Colorize and overlay onto original image ─────────────────
         heatmap_resized = cv2.resize(heatmap, (256, 256))
         heatmap_uint8 = np.uint8(255 * heatmap_resized)
         heatmap_colored = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_JET)
 
-        # PIL gives us RGB; convert to BGR for OpenCV blending
-        original_rgb = np.uint8(255 * img_array[0])             # (256, 256, 3) RGB
+        original_rgb = np.uint8(255 * img_array[0])
         original_bgr = cv2.cvtColor(original_rgb, cv2.COLOR_RGB2BGR)
 
-        # Alpha blend: 60% original image + 40% heatmap overlay
         superimposed = cv2.addWeighted(original_bgr, 0.6, heatmap_colored, 0.4, 0)
 
         _, buffer = cv2.imencode(".png", superimposed)
@@ -209,31 +205,29 @@ def health():
 @app.route('/predict/image', methods=['POST'])
 def predict_image():
     try:
-        # Scenario A: Handle standard multipart form data uploads directly from app1.py
+        # Scenario A: Multipart form-data upload
         if 'image' in request.files:
             file = request.files['image']
             img = Image.open(file.stream).convert('RGB').resize((256, 256))
             input_data = np.array(img, dtype=np.float32) / 255.0
             input_data = np.expand_dims(input_data, axis=0)
 
-        # Scenario B: Backward compatibility for local raw pixel JSON arrays
+        # Scenario B: Raw JSON pixel array
         elif request.is_json:
             data = request.get_json()
             input_data = np.array(data['input'], dtype=np.float32)
             if input_data.ndim == 3:
                 input_data = np.expand_dims(input_data, axis=0)
+
         else:
             return jsonify({
                 "error": "Invalid request. Supply multipart form-data with key 'image' or a JSON body with key 'input'."
             }), 400
 
-        # Run inference using the safe lazy-loader
         active_model = get_model()
 
         if active_model is not None:
             prediction = active_model.predict(input_data)
-
-            # FIX 3: Safe scalar extraction matching FIX 2b
             raw_score = float(tf.reshape(prediction, [-1])[0].numpy())
 
             if raw_score > 0.5:
@@ -243,10 +237,10 @@ def predict_image():
                 label = "Fake"
                 confidence = 1.0 - raw_score
 
-            # Trigger heatmap generation (returns None gracefully on failure)
             heatmap_b64 = generate_gradcam_heatmap(input_data, active_model)
+            print(f"🗺️ Heatmap generated: {heatmap_b64 is not None}")
+
         else:
-            # Stub fallback when model is unavailable
             print("⚠️ Model not initialized. Returning stub response.")
             label = "Fake"
             confidence = 0.85
@@ -272,5 +266,5 @@ def predict_image():
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5002))
-    print(f"📢 Starting Image Deepfake Detection service on 0.0.0.0:{port}...")
+    print(f"📢 Starting Veritas Image service on 0.0.0.0:{port}...")
     app.run(host='0.0.0.0', port=port, debug=False)
