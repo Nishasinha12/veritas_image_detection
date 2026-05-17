@@ -79,31 +79,25 @@ def get_model():
 # Grad-CAM Heatmap Generation Engine
 # ───────────────────────────────────────────────────────────────────────────
 def get_last_conv_layer(loaded_model):
-    """
-    FIX 1: Returns the LAST convolutional layer before the classifier head.
-    Grad-CAM needs the final conv layer to capture the richest spatial features.
-    The original code used -len//2 (a middle layer) which produces weak/noisy maps.
-    Also scans for BatchNorm/Activation wrappers after conv blocks (e.g. EfficientNet).
-    """
+    """Finds optimal intermediate convolutional layer for clear spatial coverage."""
     layer_names = [l.name for l in loaded_model.layers]
 
-    # Preferred terminal feature layers for EfficientNet / ResNet / MobileNet
-    preferred = ['top_conv', 'top_activation', 'block7a_project_conv',
-                 'block6a_expand_conv', 'conv5_block3_out', 'Conv_1']
+    preferred = ['block6a_expand_conv', 'block5a_expand_conv', 'block4a_expand_conv', 'top_conv']
     for name in preferred:
         if name in layer_names:
-            print(f"✅ Using preferred Grad-CAM layer: {name}")
+            print(f"✅ Using preferred layer: {name}")
             return name
 
-    # Dynamic fallback: walk layers in REVERSE and pick the first Conv2D
-    for layer in reversed(loaded_model.layers):
-        if isinstance(layer, (tf.keras.layers.Conv2D,
-                               tf.keras.layers.DepthwiseConv2D,
-                               tf.keras.layers.SeparableConv2D)):
-            print(f"✅ Fallback Grad-CAM layer selected: {layer.name}")
-            return layer.name
+    conv_layers = [
+        l.name for l in loaded_model.layers
+        if isinstance(l, tf.keras.layers.Conv2D)
+    ]
+    if conv_layers:
+        chosen = conv_layers[len(conv_layers) // 2]
+        print(f"✅ Using fallback conv layer: {chosen}")
+        return chosen
 
-    print("⚠️ No convolutional layer found in model.")
+    print("❌ No Conv2D layers found in model")
     return None
 
 
@@ -146,25 +140,18 @@ def generate_gradcam_heatmap(img_array, loaded_model):
         # FIX 2a: Use persistent=True tape and watch conv_outputs, not img_tensor.
         # The gradient of the class score w.r.t. the conv feature map is what
         # Grad-CAM needs. Watching the image gives pixel gradients — not useful here.
-        with tf.GradientTape(persistent=True) as tape:
+        with tf.GradientTape() as tape:
             conv_outputs, predictions = grad_model(img_tensor, training=False)
-            tape.watch(conv_outputs)  # ← KEY FIX: watch activations, not input
+            tape.watch(conv_outputs)   # ✅ watch the conv layer, not the input
+            loss = predictions[:, 0]
 
-            # FIX 2b: Robustly extract scalar loss regardless of output shape.
-            # predictions could be (1,1), (1,), or scalar — flatten safely.
-            loss = tf.reshape(predictions, [-1])[0]
-
-        # Gradient of class score w.r.t. the conv feature map spatial activations
+        # Extract target spatial weights feature map gradient
         grads = tape.gradient(loss, conv_outputs)
-        del tape  # Release persistent tape immediately to free memory
-
         if grads is None:
-            print("⚠️ Gradients are None — layer may not be connected to output.")
+            print("⚠️ Gradients are None — layer may not be differentiable")
             return None
-
-        # Global average pool the gradients over the spatial (H, W) axes → (C,)
         pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
-
+        
         # Weight each feature map channel by its pooled gradient importance
         conv_outputs = conv_outputs[0]                          # (H, W, C)
         heatmap = conv_outputs @ pooled_grads[..., tf.newaxis]  # (H, W, 1)
