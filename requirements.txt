@@ -1,8 +1,10 @@
 flask
 flask-cors
-numpy
+numpy==1.24.3
 pillow
-tensorflow
+tensorflow-cpu==2.13.0
 gunicorn
 scipy
-gdown
+huggingface_hub
+opencv-python-headless
+h5py==3.9.0

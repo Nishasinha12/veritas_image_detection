@@ -3,4 +3,6 @@ venv/
 __pycache__/
 *.pyc
 .env
-# Ignore large local model weights files if you download them locally
+# Ignore large local model weights files if you download them locally*.h5
+*.h5
+models/
