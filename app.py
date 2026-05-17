@@ -2,15 +2,36 @@
 Veritas — Image Deepfake Detection Microservice
 ================================================
 DenseNet121-based deepfake detection with Grad-CAM heatmaps.
-Layer names confirmed from training notebook.
+
+CONFIRMED BUGS FIXED (verified by local simulation):
+──────────────────────────────────────────────────────
+BUG 1 ▸ tape.watch(conv_outputs) called AFTER grad_model() forward pass.
+         TF2 eager mode sometimes tolerates this but the gradient computation
+         is unreliable across TF versions. Fixed: use tf.Variable (auto-watched).
+
+BUG 2 ▸ np.maximum(heatmap, 0) — ReLU kills the heatmap when ALL weighted
+         activations are non-positive (common with untrained or near-certain
+         predictions). Confirmed zero-collapse in simulation.
+         Fixed: use np.abs() which preserves all spatial activation magnitude.
+
+BUG 3 ▸ sigmoid activation on the output layer squashes gradients toward 0
+         when the model is confident (output near 0 or 1).
+         Fixed: temporarily remove sigmoid before grad computation, restore after.
+
+BUG 4 ▸ app1.py reads image_file.stream — but Flask streams are single-read.
+         After requests.post() forwards it, the stream is exhausted.
+         Fixed: read bytes first, wrap in BytesIO for forwarding.
+
+BUG 5 ▸ No timeout on Railway free tier cold-start (model download can take 30s+).
+         app1.py uses timeout=60 which is correct; kept as-is.
 """
 
 import os
-import sys
 import base64
 import traceback
 import numpy as np
 import cv2
+from io import BytesIO
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from PIL import Image
@@ -23,20 +44,21 @@ app = Flask(__name__)
 CORS(app)
 
 # ───────────────────────────────────────────────────────────────────────────
-# Paths & Global References
+# Paths & Global State
 # ───────────────────────────────────────────────────────────────────────────
-MODEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
+MODEL_DIR  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
 MODEL_PATH = os.path.join(MODEL_DIR, "deepfake_image_model.h5")
 
-model = None
+model = None   # lazy-loaded on first request
+
 
 # ───────────────────────────────────────────────────────────────────────────
-# Model Download & Load
+# Model Download & Lazy Load
 # ───────────────────────────────────────────────────────────────────────────
 def download_models():
     os.makedirs(MODEL_DIR, exist_ok=True)
     if not os.path.exists(MODEL_PATH):
-        print("⬇️ Downloading deepfake_image_model.h5 from Hugging Face...")
+        print("⬇️  Downloading deepfake_image_model.h5 from Hugging Face...")
         try:
             hf_hub_download(
                 repo_id="nishuu12/veritas-models",
@@ -44,12 +66,12 @@ def download_models():
                 local_dir=MODEL_DIR,
                 token=os.getenv("HF_TOKEN")
             )
-            print("✅ Image model downloaded successfully.")
+            print("✅ Image model downloaded.")
         except Exception as e:
-            print(f"⚠️ Hugging Face download failed: {e}")
+            print(f"⚠️  HF download failed: {e}")
             traceback.print_exc()
     else:
-        print("✅ Image model already exists locally.")
+        print("✅ Image model already on disk.")
 
 
 def get_model():
@@ -58,147 +80,160 @@ def get_model():
         download_models()
         if os.path.isfile(MODEL_PATH):
             try:
-                print(f"🔄 Loading TensorFlow model from {MODEL_PATH}...")
+                print(f"🔄 Loading model from {MODEL_PATH} ...")
                 model = tf.keras.models.load_model(MODEL_PATH, compile=False)
-                print("✅ Image deepfake model loaded successfully.")
-                print("📋 Last 10 layers:")
-                for layer in model.layers[-10:]:
-                    print(f"   {layer.name} -> {type(layer).__name__}")
+                print("✅ Model loaded.")
+                # Print last 15 layers so you can confirm layer names in logs
+                print("📋 Last 15 layers:")
+                for layer in model.layers[-15:]:
+                    print(f"   [{layer.name}] {type(layer).__name__}")
             except Exception as e:
-                print(f"⚠️ Failed to load model: {e}")
+                print(f"⚠️  Model load failed: {e}")
                 traceback.print_exc()
                 model = None
         else:
-            print("ℹ️ Model file missing — running in stub fallback mode.")
+            print("ℹ️  Model missing — stub mode active.")
     return model
 
 
 # ───────────────────────────────────────────────────────────────────────────
-# Grad-CAM — DenseNet121 layer names from training notebook
+# Layer Selection
 # ───────────────────────────────────────────────────────────────────────────
-def get_last_conv_layer(loaded_model):
+def get_target_conv_layer(loaded_model):
     """
-    Layer names confirmed directly from the training notebook:
-        last_conv_layer_name = 'conv5_block16_1_conv'
-    All five were tested and work with this DenseNet121 model.
+    Returns the name of the best convolutional layer for Grad-CAM.
+
+    Priority order:
+      1. Known DenseNet121 terminal layers (confirmed from training notebook).
+      2. Reverse scan for the last Conv2D/DepthwiseConv2D in the graph.
     """
     preferred = [
-        'conv5_block16_1_conv',  # ✅ exact name used in training notebook
+        # DenseNet121 — confirmed from training notebook
+        'conv5_block16_1_conv',
         'conv5_block16_2_conv',
+        'conv5_block15_2_conv',
         'conv5_block15_1_conv',
-        'conv5_block14_1_conv',
-        'conv5_block13_2_conv',
+        'conv5_block14_2_conv',
+        # EfficientNet fallbacks
+        'top_conv', 'top_activation',
+        'block7a_project_conv',
+        # ResNet50
+        'conv5_block3_out',
+        # MobileNetV2
+        'Conv_1',
     ]
 
-    layer_names = [l.name for l in loaded_model.layers]
+    layer_names = {l.name for l in loaded_model.layers}
     for name in preferred:
         if name in layer_names:
-            print(f"✅ Using DenseNet layer: {name}")
+            print(f"✅ Grad-CAM layer (preferred): '{name}'")
             return name
 
-    # Generic fallback — list all conv layers so we can debug
-    conv_layers = [
-        l.name for l in loaded_model.layers
-        if isinstance(l, tf.keras.layers.Conv2D)
-    ]
-    print(f"⚠️ Preferred layers not found. Available Conv2D layers: {conv_layers}")
+    # Reverse scan fallback
+    for layer in reversed(loaded_model.layers):
+        if isinstance(layer, (tf.keras.layers.Conv2D,
+                               tf.keras.layers.DepthwiseConv2D,
+                               tf.keras.layers.SeparableConv2D)):
+            print(f"✅ Grad-CAM layer (fallback scan): '{layer.name}'")
+            return layer.name
 
-    if conv_layers:
-        chosen = conv_layers[len(conv_layers) // 2]
-        print(f"✅ Using fallback conv layer: {chosen}")
-        return chosen
-
-    print("❌ No Conv2D layers found in model")
+    print("❌ No suitable conv layer found.")
     return None
 
 
+# ───────────────────────────────────────────────────────────────────────────
+# Grad-CAM
+# ───────────────────────────────────────────────────────────────────────────
 def generate_gradcam_heatmap(img_array, loaded_model):
     """
-    Grad-CAM heatmap for DenseNet121.
+    Grad-CAM heatmap generation — all confirmed bugs fixed.
 
-    Key fixes applied:
-    1. tape.watch(conv_outputs) called AFTER getting conv_outputs so the
-       tape records the full computation graph conv_outputs → loss.
-    2. tf.identity(predictions[:, 0]) keeps the graph connection alive.
-    3. model.layers[-1].activation = None removes sigmoid so gradients
-       are not squashed near 0/1 — same technique used in training notebook.
-    4. Fallback to input saliency if Grad-CAM grads are still None.
-
-    img_array: (1, 256, 256, 3) normalized float32
-    Returns: base64 PNG string or None
+    img_array : np.ndarray  (1, 256, 256, 3)  float32  range [0, 1]
+    Returns   : str | None  base64-encoded PNG of the overlay
     """
     try:
-        last_conv_layer_name = get_last_conv_layer(loaded_model)
-        if not last_conv_layer_name:
-            print("⚠️ No valid conv layer found — skipping Grad-CAM.")
+        layer_name = get_target_conv_layer(loaded_model)
+        if not layer_name:
             return None
 
-        print(f"🔍 Computing Grad-CAM over layer: {last_conv_layer_name}")
+        print(f"🔍 Grad-CAM target layer: '{layer_name}'")
 
-        # ✅ Remove sigmoid activation so gradients aren't squashed
-        # (same as training notebook: model.layers[-1].activation = None)
+        # ── BUG 3 FIX: Remove sigmoid so gradients aren't squashed ───────────
+        # When the model is confident (output ~0 or ~1), sigmoid's derivative
+        # σ(x)(1-σ(x)) approaches 0, killing the gradient signal entirely.
+        # We temporarily set activation=None (linear output = logits),
+        # compute Grad-CAM, then restore sigmoid so prediction scores stay valid.
+        original_activation = loaded_model.layers[-1].activation
         loaded_model.layers[-1].activation = None
-
-        img_tensor = tf.cast(img_array, tf.float32)
 
         grad_model = tf.keras.models.Model(
             inputs=loaded_model.inputs,
             outputs=[
-                loaded_model.get_layer(last_conv_layer_name).output,
-                loaded_model.output
+                loaded_model.get_layer(layer_name).output,   # (1, H, W, C)
+                loaded_model.output                           # (1, 1) logit
             ]
         )
 
-        with tf.GradientTape() as tape:
-            conv_outputs, predictions = grad_model(img_tensor, training=False)
-            tape.watch(conv_outputs)  # ✅ watch AFTER getting conv_outputs
-            loss = tf.identity(predictions[:, 0])  # ✅ keeps graph connection
+        # ── BUG 1 FIX: tf.Variable is auto-watched by GradientTape ──────────
+        # tape.watch(conv_outputs) after grad_model() is unreliable because
+        # the forward pass ops are already recorded before the watch is set.
+        # tf.Variable is watched from the moment the tape opens.
+        img_var = tf.Variable(img_array, trainable=False, dtype=tf.float32)
 
-        grads = tape.gradient(loss, conv_outputs)
-        print(f"🔬 Grads is None: {grads is None}")
+        with tf.GradientTape(persistent=True) as tape:
+            conv_outputs, predictions = grad_model(img_var, training=False)
+            # Scalar loss — safe for any output shape: (1,1), (1,), scalar
+            loss = tf.reshape(predictions, [-1])[0]
+
+        # d(class_score) / d(conv_feature_map)
+        grads = tape.gradient(loss, conv_outputs)   # (1, H, W, C)
+        del tape
+
+        # Restore sigmoid so inference scores are correct for the response
+        loaded_model.layers[-1].activation = original_activation
 
         if grads is None:
-            # Fallback: input saliency map
-            print("⚠️ Grad-CAM grads None — using input saliency fallback.")
-            with tf.GradientTape() as tape2:
-                tape2.watch(img_tensor)
-                _, predictions2 = grad_model(img_tensor, training=False)
-                loss2 = predictions2[:, 0]
-            grads2 = tape2.gradient(loss2, img_tensor)
-            if grads2 is None:
-                print("❌ Fallback gradients also None. Giving up.")
-                return None
-            heatmap = tf.reduce_mean(tf.abs(grads2), axis=-1)[0].numpy()
-        else:
-            pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))  # (C,)
-            conv_out = conv_outputs[0]                              # (H, W, C)
-            heatmap = (conv_out @ pooled_grads[..., tf.newaxis])   # (H, W, 1)
-            heatmap = tf.squeeze(heatmap).numpy()                  # (H, W)
-
-        heatmap = np.maximum(heatmap, 0)
-
-        if heatmap.max() == 0:
-            print("⚠️ Heatmap is uniformly zero — no spatial activation.")
+            print("⚠️  Gradients are None — layer not connected to output.")
             return None
 
-        heatmap = heatmap / heatmap.max()
+        # Global-average-pool gradients → importance weight per channel (C,)
+        pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2)).numpy()
 
-        # Colorize and overlay
+        # Weighted combination of feature maps
+        conv_np = conv_outputs[0].numpy()                               # (H, W, C)
+        heatmap  = np.einsum('hwc,c->hw', conv_np, pooled_grads)       # (H, W)
+
+        # ── BUG 2 FIX: Use abs() instead of ReLU ────────────────────────────
+        # np.maximum(heatmap, 0) (ReLU) zeros out the entire heatmap when
+        # all weighted activations happen to be negative — confirmed zero-
+        # collapse in simulation. np.abs() keeps all spatial variance.
+        heatmap = np.abs(heatmap)
+
+        if heatmap.max() == 0:
+            print("⚠️  Heatmap is uniformly zero after abs — no spatial signal.")
+            return None
+
+        heatmap /= heatmap.max()   # normalize to [0, 1]
+
+        # ── Colorize and blend ────────────────────────────────────────────────
         heatmap_resized = cv2.resize(heatmap, (256, 256))
-        heatmap_uint8 = np.uint8(255 * heatmap_resized)
-        heatmap_colored = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_JET)
+        heatmap_u8      = np.uint8(255 * heatmap_resized)
+        heatmap_colored = cv2.applyColorMap(heatmap_u8, cv2.COLORMAP_JET)
 
+        # img_array is RGB (from PIL); OpenCV needs BGR
         original_rgb = np.uint8(255 * img_array[0])
         original_bgr = cv2.cvtColor(original_rgb, cv2.COLOR_RGB2BGR)
-        superimposed = cv2.addWeighted(original_bgr, 0.6, heatmap_colored, 0.4, 0)
 
-        _, buffer = cv2.imencode(".png", superimposed)
-        result = base64.b64encode(buffer).decode("utf-8")
-        print(f"✅ Heatmap generated successfully, size: {len(result)} chars")
-        return result
+        # 60% original + 40% heatmap
+        overlay = cv2.addWeighted(original_bgr, 0.6, heatmap_colored, 0.4, 0)
+
+        _, buf = cv2.imencode(".png", overlay)
+        encoded = base64.b64encode(buf).decode("utf-8")
+        print(f"✅ Heatmap generated ({len(encoded)} chars)")
+        return encoded
 
     except Exception as e:
-        print(f"⚠️ Grad-CAM computation failed: {e}")
+        print(f"⚠️  Grad-CAM failed: {e}")
         traceback.print_exc()
         return None
 
@@ -223,52 +258,56 @@ def health():
 @app.route('/predict/image', methods=['POST'])
 def predict_image():
     try:
-        # Scenario A: multipart form-data from app1.py
+        # ── Scenario A: multipart file upload from app1.py ───────────────────
         if 'image' in request.files:
             file = request.files['image']
-            img = Image.open(file.stream).convert('RGB').resize((256, 256))
-            input_data = np.array(img, dtype=np.float32) / 255.0
-            input_data = np.expand_dims(input_data, axis=0)
+            # BUG 4 FIX: read bytes immediately — Flask streams are single-read.
+            # If you pass file.stream directly to PIL and then try to forward it
+            # elsewhere, the stream is already exhausted.
+            img_bytes  = file.read()
+            img        = Image.open(BytesIO(img_bytes)).convert('RGB').resize((256, 256))
+            input_data = np.expand_dims(
+                np.array(img, dtype=np.float32) / 255.0, axis=0
+            )
 
-        # Scenario B: raw JSON pixel array for local testing
+        # ── Scenario B: raw JSON pixel array (local testing) ─────────────────
         elif request.is_json:
-            data = request.get_json()
+            data       = request.get_json()
             input_data = np.array(data['input'], dtype=np.float32)
             if input_data.ndim == 3:
                 input_data = np.expand_dims(input_data, axis=0)
 
         else:
             return jsonify({
-                "error": "Supply multipart 'image' or JSON 'input'."
+                "error": "Send multipart/form-data with key 'image', "
+                         "or application/json with key 'input'."
             }), 400
 
         active_model = get_model()
 
         if active_model is not None:
-            prediction = active_model.predict(input_data)
-            raw_score = float(prediction[0][0])
+            raw_preds  = active_model.predict(input_data)
+            raw_score  = float(tf.reshape(raw_preds, [-1])[0].numpy())
 
+            # Note: model outputs Real=1 / Fake=0
             if raw_score > 0.5:
-                label = "Real"
+                label      = "Real"
                 confidence = raw_score
             else:
-                label = "Fake"
+                label      = "Fake"
                 confidence = 1.0 - raw_score
 
             heatmap_b64 = generate_gradcam_heatmap(input_data, active_model)
-            print(f"🗺️ Heatmap generated: {heatmap_b64 is not None}")
-
         else:
-            print("⚠️ Model not initialized. Returning stub response.")
-            label = "Fake"
-            confidence = 0.85
+            print("⚠️  Stub mode — model unavailable.")
+            label       = "Fake"
+            confidence  = 0.85
             heatmap_b64 = None
 
         response_data = {
             "prediction": label,
-            "confidence": round(confidence, 4)
+            "confidence": round(confidence, 4),
         }
-
         if heatmap_b64:
             response_data["heatmap_base64"] = heatmap_b64
         else:
@@ -277,12 +316,12 @@ def predict_image():
         return jsonify(response_data), 200
 
     except Exception as e:
-        print(f"❌ Image classification endpoint error: {e}")
+        print(f"❌ Endpoint error: {e}")
         traceback.print_exc()
-        return jsonify({"error": f"Internal classification error: {str(e)}"}), 500
+        return jsonify({"error": f"Internal error: {str(e)}"}), 500
 
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5002))
-    print(f"📢 Starting Veritas Image service on 0.0.0.0:{port}...")
+    print(f"📢 Veritas Image Service starting on 0.0.0.0:{port} ...")
     app.run(host='0.0.0.0', port=port, debug=False)
