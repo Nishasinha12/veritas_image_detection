@@ -235,7 +235,11 @@ def predict_image():
 
 
 if __name__ == '__main__':
-    # Binds to environment variable PORT for seamless cloud provider integration (e.g. Cloud Run / Render)
     port = int(os.environ.get("PORT", 5002))
-    print(f"📢 Starting Image Deepfake Detection service on 0.0.0.0:{port}...")
+    print("🔄 Pre-loading model at startup...")
+    get_model()  # Force load now, not on first request
+    if model is None:
+        print("❌ FATAL: Model failed to load. Check HF_TOKEN and model path.")
+        sys.exit(1)  # Crash loudly — don't serve stub responses silently
+    print("✅ Model ready. Starting server...")
     app.run(host='0.0.0.0', port=port, debug=False)
